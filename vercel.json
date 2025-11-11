@@ -1,13 +1,6 @@
 {
-  "functions": {
-    "api/index.py": {
-      "runtime": "python3.9",
-      "memory": 1024,
-      "maxDuration": 10
-    }
-  },
-  "routes": [
-    { "src": "/api(?:/.*)?", "dest": "/api/index.py" }
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index.py" }
   ]
 }
 
