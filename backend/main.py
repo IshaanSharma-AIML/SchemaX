@@ -24,11 +24,20 @@ import urllib.parse
 from psycopg2.errors import IntegrityError
 from collections import defaultdict
 import asyncio
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import seaborn as sns
-import pandas as pd
+# Optional visualization imports (may not be available in serverless environments)
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import seaborn as sns
+    import pandas as pd
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    plt = None
+    sns = None
+    pd = None
+
 import base64
 from io import BytesIO
 
@@ -834,6 +843,8 @@ Your role is to provide valuable insights based on the specific project context 
 
     def generate_visualization(self, question: str, project_context: str = ""):
         """Generate data visualization based on the question"""
+        if not VISUALIZATION_AVAILABLE:
+            return None, "Visualization features are not available in this environment. Please install matplotlib, seaborn, and pandas for visualization support."
         try:
             # First, get the data using the existing query logic
             results, analysis = self.execute_query(question, project_context)
@@ -915,6 +926,8 @@ Your role is to provide valuable insights based on the specific project context 
                 return None, "No suitable data found for visualization"
             
             # Convert result to DataFrame
+            if not VISUALIZATION_AVAILABLE or pd is None:
+                return None, "Visualization libraries not available"
             df = pd.DataFrame(best_result['result'])
             
             if df.empty:
@@ -1000,7 +1013,12 @@ Your role is to provide valuable insights based on the specific project context 
     
     def _determine_chart_type(self, df, question):
         """Determine the best chart type based on data and question"""
-        import numpy as np
+        if not VISUALIZATION_AVAILABLE:
+            return 'bar'  # Default fallback
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
         question_lower = question.lower()
         
         # Check for specific chart type requests
@@ -1016,6 +1034,8 @@ Your role is to provide valuable insights based on the specific project context 
             return 'histogram'
         
         # Auto-determine based on data structure
+        if np is None:
+            return 'bar'  # Default fallback if numpy not available
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         categorical_cols = df.select_dtypes(include=['object', 'category']).columns
         
@@ -1033,6 +1053,8 @@ Your role is to provide valuable insights based on the specific project context 
     
     def _create_chart(self, df, chart_type, question):
         """Create the actual chart"""
+        if not VISUALIZATION_AVAILABLE:
+            raise ImportError("Visualization libraries not available")
         try:
             import numpy as np
             plt.style.use('seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available else 'default')
