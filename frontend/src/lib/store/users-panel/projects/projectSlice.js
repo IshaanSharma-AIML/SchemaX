@@ -2,10 +2,10 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import { toast } from 'react-hot-toast';
 
-const API_URL = process.env.NEXT_PUBLIC_API_BASE;
+const API_URL = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000/api';
 
-if (!API_URL) {
-    console.error('[CONFIG] NEXT_PUBLIC_API_BASE is not defined. API requests will fail until it is set.');
+if (!process.env.NEXT_PUBLIC_API_BASE) {
+    console.warn('[CONFIG] NEXT_PUBLIC_API_BASE not set; defaulting to http://localhost:8000/api for local development.');
 }
 
 // --- Reusable function to handle API requests ---
@@ -38,8 +38,8 @@ const makeApiRequest = async (url, method, body, thunkAPI) => {
         if (url.match(/\/projects\/[^/]+$/) && method === 'GET') {
             return data.project;
         }
-        // For Python backend, return data.projects; for JS backend, return data.data
-        return BACKEND_TYPE === 'python' ? data.projects : data.data;
+        // Python backend returns data.projects for list endpoints
+        return data.projects;
     } catch (error) {
         const message = (error.response && error.response.data && error.response.data.message) || error.message || error.toString();
         return thunkAPI.rejectWithValue(message);

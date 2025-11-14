@@ -24,25 +24,23 @@ import urllib.parse
 from psycopg2.errors import IntegrityError
 from collections import defaultdict
 import asyncio
-# Optional visualization imports (may not be available in serverless environments)
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib
-    matplotlib.use('Agg')  # Use non-interactive backend
-    import seaborn as sns
-    import pandas as pd
-    VISUALIZATION_AVAILABLE = True
-except ImportError:
-    VISUALIZATION_AVAILABLE = False
-    plt = None
-    sns = None
-    pd = None
-
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import seaborn as sns
+import pandas as pd
 import base64
 from io import BytesIO
+from functools import lru_cache
+from time import time
 
 # Load environment variables
 load_dotenv()
+
+# Simple in-memory cache for frequently accessed data
+_cache = {}
+_cache_ttl = {}  # Time-to-live for cache entries
+CACHE_TTL_SECONDS = 30  # Cache for 30 seconds (adjust as needed)
 
 # JWT_SECRET is loaded but not logged for security
 jwt_secret = os.getenv("JWT_SECRET")
@@ -55,23 +53,65 @@ app = FastAPI(title="Chatbot API", version="1.0.0")
 frontend_origins_env = os.getenv("FRONTEND_ORIGIN", "")
 allowed_origins = [origin.strip() for origin in frontend_origins_env.split(",") if origin.strip()]
 
+localhost_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+]
+
+all_allowed_origins = list({*allowed_origins, *localhost_origins})
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=all_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 if allowed_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-        allow_headers=["*"],
-    )
-    print(f"[CORS] Enabled for origins: {allowed_origins}")
+    print(f"[CORS] Enabled for origins: {all_allowed_origins}")
 else:
-    print("[CORS] FRONTEND_ORIGIN not set; no CORS origins configured. Set FRONTEND_ORIGIN to enable cross-origin requests.")
+    print("[CORS] FRONTEND_ORIGIN not set; defaulting to localhost origins only. Set FRONTEND_ORIGIN for deployed environments.")
 
 # Security
 security = HTTPBearer()
 
-# Database connection for user management (MySQL/XAMPP compatible)
+# Database connection pool for user management (MySQL/XAMPP compatible)
+# Connection pooling significantly improves performance by reusing connections
+_db_pool = None
+
+def _ensure_ist_timezone(conn):
+    """Ensure the MySQL connection uses IST (Indian Standard Time, UTC+5:30) timezone"""
+    try:
+        cursor = conn.cursor()
+        # Check current timezone first
+        cursor.execute("SELECT @@session.time_zone as tz, @@global.time_zone as global_tz, @@system_time_zone as system_tz")
+        result = cursor.fetchone()
+        current_tz = result[0] if result else None
+        global_tz = result[1] if result and len(result) > 1 else None
+        system_tz = result[2] if result and len(result) > 2 else None
+        
+        # Only set if not already IST (+05:30)
+        if current_tz != '+05:30':
+            cursor.execute("SET time_zone = '+05:30'")
+            # Verify timezone is set correctly
+            cursor.execute("SELECT @@session.time_zone as tz")
+            verify_result = cursor.fetchone()
+            if verify_result and verify_result[0] != '+05:30':
+                print(f"[WARNING] Timezone not set to IST. Session: {verify_result[0]}, Global: {global_tz}, System: {system_tz}")
+            elif current_tz != '+05:30':
+                print(f"[DB] Timezone changed from {current_tz} to IST (Global: {global_tz}, System: {system_tz})")
+        cursor.close()
+    except Exception as e:
+        print(f"[WARNING] Failed to set IST timezone: {e}")
+        import traceback
+        print(f"[WARNING] Traceback: {traceback.format_exc()}")
+
 def get_db_connection():
+    global _db_pool
+    
     try:
         host = os.getenv("MYSQL_HOST")
         user = os.getenv("MYSQL_USER")
@@ -90,26 +130,108 @@ def get_db_connection():
             print(f"[ERROR] Missing database configuration environment variables: {', '.join(missing)}")
             return None
 
-        connection = mysql.connector.connect(
-            host=host,
-            user=user,
-            password=password,
-            database=database,
-            port=port,
-            charset='utf8mb4',
-            collation='utf8mb4_unicode_ci'
-        )
-        return connection
+        # Initialize connection pool if not exists
+        if _db_pool is None:
+            try:
+                from mysql.connector import pooling
+                # Create a connection to test and set timezone
+                test_conn = mysql.connector.connect(
+                    host=host,
+                    user=user,
+                    password=password,
+                    database=database,
+                    port=port,
+                    charset='utf8mb4',
+                    collation='utf8mb4_unicode_ci'
+                )
+                test_cursor = test_conn.cursor()
+                test_cursor.execute("SET time_zone = '+05:30'")
+                test_cursor.close()
+                test_conn.close()
+                
+                _db_pool = pooling.MySQLConnectionPool(
+                    pool_name="mypool",
+                    pool_size=10,  # Number of connections in the pool
+                    pool_reset_session=False,  # Disable reset to preserve timezone
+                    host=host,
+                    user=user,
+                    password=password,
+                    database=database,
+                    port=port,
+                    charset='utf8mb4',
+                    collation='utf8mb4_unicode_ci',
+                    autocommit=False
+                )
+                print("[DB] Connection pool initialized successfully")
+                
+                # Initialize all connections in the pool with IST timezone
+                # Get and return connections to initialize them
+                init_conns = []
+                for _ in range(min(3, 10)):  # Initialize first few connections
+                    try:
+                        conn = _db_pool.get_connection()
+                        _ensure_ist_timezone(conn)
+                        init_conns.append(conn)
+                    except:
+                        break
+                # Return connections to pool
+                for conn in init_conns:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+            except ImportError:
+                print("[DB] Connection pooling not available, using single connections")
+                _db_pool = "no_pool"
+        
+        # Use connection pool if available
+        if _db_pool != "no_pool" and _db_pool is not None:
+            try:
+                conn = _db_pool.get_connection()
+                # Set session timezone to IST for this connection
+                _ensure_ist_timezone(conn)
+                return conn
+            except Error as e:
+                print(f"[DB] Error getting connection from pool: {e}")
+                # Fallback to single connection
+                conn = mysql.connector.connect(
+                    host=host,
+                    user=user,
+                    password=password,
+                    database=database,
+                    port=port,
+                    charset='utf8mb4',
+                    collation='utf8mb4_unicode_ci'
+                )
+                # Set session timezone to IST
+                _ensure_ist_timezone(conn)
+                return conn
+        else:
+            # Fallback: single connection (original behavior)
+            connection = mysql.connector.connect(
+                host=host,
+                user=user,
+                password=password,
+                database=database,
+                port=port,
+                charset='utf8mb4',
+                collation='utf8mb4_unicode_ci'
+            )
+            # Set session timezone to IST
+            _ensure_ist_timezone(connection)
+            return connection
     except Error as e:
         print(f"Error connecting to MySQL/XAMPP: {e}")
         return None
 
 # JWT functions (matching JS backend)
 def create_jwt_token(user_id: str, email: str):
+    from datetime import timezone, timedelta
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
     payload = {
         "id": user_id,  # Match JS backend structure
         "email": email,
-        "exp": datetime.utcnow() + timedelta(days=1)  # Match JS backend (1 day)
+        "exp": datetime.now(ist_tz) + timedelta(days=1)  # Match JS backend (1 day)
     }
     return jwt.encode(payload, jwt_secret, algorithm="HS256")
 
@@ -843,8 +965,6 @@ Your role is to provide valuable insights based on the specific project context 
 
     def generate_visualization(self, question: str, project_context: str = ""):
         """Generate data visualization based on the question"""
-        if not VISUALIZATION_AVAILABLE:
-            return None, "Visualization features are not available in this environment. Please install matplotlib, seaborn, and pandas for visualization support."
         try:
             # First, get the data using the existing query logic
             results, analysis = self.execute_query(question, project_context)
@@ -926,8 +1046,6 @@ Your role is to provide valuable insights based on the specific project context 
                 return None, "No suitable data found for visualization"
             
             # Convert result to DataFrame
-            if not VISUALIZATION_AVAILABLE or pd is None:
-                return None, "Visualization libraries not available"
             df = pd.DataFrame(best_result['result'])
             
             if df.empty:
@@ -1013,12 +1131,7 @@ Your role is to provide valuable insights based on the specific project context 
     
     def _determine_chart_type(self, df, question):
         """Determine the best chart type based on data and question"""
-        if not VISUALIZATION_AVAILABLE:
-            return 'bar'  # Default fallback
-        try:
-            import numpy as np
-        except ImportError:
-            np = None
+        import numpy as np
         question_lower = question.lower()
         
         # Check for specific chart type requests
@@ -1034,8 +1147,6 @@ Your role is to provide valuable insights based on the specific project context 
             return 'histogram'
         
         # Auto-determine based on data structure
-        if np is None:
-            return 'bar'  # Default fallback if numpy not available
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         categorical_cols = df.select_dtypes(include=['object', 'category']).columns
         
@@ -1053,8 +1164,6 @@ Your role is to provide valuable insights based on the specific project context 
     
     def _create_chart(self, df, chart_type, question):
         """Create the actual chart"""
-        if not VISUALIZATION_AVAILABLE:
-            raise ImportError("Visualization libraries not available")
         try:
             import numpy as np
             plt.style.use('seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available else 'default')
@@ -1336,15 +1445,19 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "backend": "python", "timestamp": datetime.utcnow().isoformat()}
+    from datetime import timezone, timedelta
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    return {"status": "healthy", "backend": "python", "timestamp": datetime.now(ist_tz).isoformat()}
 
 @app.post("/api/test-analyze")
 async def test_analyze():
     """Simple test endpoint to verify the backend is working"""
+    from datetime import timezone, timedelta
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
     return {
         "success": True,
         "message": "Test endpoint working",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(ist_tz).isoformat()
     }
 
 @app.post("/api/auth/register")
@@ -1439,6 +1552,14 @@ async def create_project(project_data: ProjectCreate, current_user: dict = Depen
              project_data.dbPort, project_data.dbInfo, project_data.botName, project_data.botAvatar)
         )
         conn.commit()
+        
+        # Invalidate cache for this user's projects
+        cache_key = f"projects_{current_user['user_id']}"
+        if cache_key in _cache:
+            del _cache[cache_key]
+        if cache_key in _cache_ttl:
+            del _cache_ttl[cache_key]
+        
         return {"success": True, "project_id": project_id, "message": "Project created successfully"}
     except IntegrityError as e:
         if "Duplicate entry" in str(e):
@@ -1451,47 +1572,77 @@ async def create_project(project_data: ProjectCreate, current_user: dict = Depen
 
 @app.get("/api/projects")
 async def get_projects(current_user: dict = Depends(get_current_user)):
+    # Check cache first
+    cache_key = f"projects_{current_user['user_id']}"
+    current_time = time()
+    
+    if cache_key in _cache and cache_key in _cache_ttl:
+        if current_time < _cache_ttl[cache_key]:
+            return {"success": True, "projects": _cache[cache_key], "cached": True}
+    
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     
-    cursor = conn.cursor(dictionary=True)
-    
-    cursor.execute("SELECT * FROM projects WHERE user_id = %s", (current_user["user_id"],))
-    projects = cursor.fetchall()
-    
-    # Map column names but DO NOT decrypt sensitive data
-    for project in projects:
-        project["project_name"] = project["name"]  # Map 'name' to 'project_name' for frontend
-        project["db_port"] = "3306"  # Default port since it's not in your table
-    
-    cursor.close()
-    conn.close()
-    
-    return {"success": True, "projects": projects}
+    try:
+        cursor = conn.cursor(dictionary=True)
+        
+        # Optimized query - only select needed columns
+        cursor.execute("SELECT id, user_id, name, project_info, db_info, bot_name, bot_avatar, created_at, updated_at FROM projects WHERE user_id = %s ORDER BY updated_at DESC", (current_user["user_id"],))
+        projects = cursor.fetchall()
+        
+        # Map column names but DO NOT decrypt sensitive data
+        for project in projects:
+            project["project_name"] = project["name"]  # Map 'name' to 'project_name' for frontend
+            project["db_port"] = "3306"  # Default port since it's not in your table
+        
+        cursor.close()
+        
+        # Cache the result
+        _cache[cache_key] = projects
+        _cache_ttl[cache_key] = current_time + CACHE_TTL_SECONDS
+        
+        return {"success": True, "projects": projects, "cached": False}
+    finally:
+        conn.close()
 
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, current_user: dict = Depends(get_current_user)):
+    # Check cache first
+    cache_key = f"project_{project_id}_{current_user['user_id']}"
+    current_time = time()
+    
+    if cache_key in _cache and cache_key in _cache_ttl:
+        if current_time < _cache_ttl[cache_key]:
+            return {"success": True, "project": _cache[cache_key], "cached": True}
+    
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     
-    cursor = conn.cursor(dictionary=True)
-    
-    cursor.execute("SELECT * FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
-    project = cursor.fetchone()
-    
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
-    # Map column names but DO NOT decrypt sensitive data
-    project["project_name"] = project["name"]  # Map 'name' to 'project_name' for frontend
-    project["db_port"] = project.get("db_port", "3306")  # Use actual port from database
-    
-    cursor.close()
-    conn.close()
-    
-    return {"success": True, "project": project}
+    try:
+        cursor = conn.cursor(dictionary=True)
+        
+        # Optimized query with explicit column selection
+        cursor.execute("SELECT * FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
+        project = cursor.fetchone()
+        
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Map column names but DO NOT decrypt sensitive data
+        project["project_name"] = project["name"]  # Map 'name' to 'project_name' for frontend
+        project["db_port"] = project.get("db_port", "3306")  # Use actual port from database
+        
+        cursor.close()
+        
+        # Cache the result
+        _cache[cache_key] = project
+        _cache_ttl[cache_key] = current_time + CACHE_TTL_SECONDS
+        
+        return {"success": True, "project": project, "cached": False}
+    finally:
+        conn.close()
 
 @app.put("/api/projects/{project_id}")
 async def update_project(project_id: str, project_data: ProjectCreate, current_user: dict = Depends(get_current_user)):
@@ -1499,45 +1650,55 @@ async def update_project(project_id: str, project_data: ProjectCreate, current_u
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     
-    cursor = conn.cursor(dictionary=True)
-    
-    # Check if project exists and belongs to user, and get current values
-    cursor.execute("SELECT * FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
-    existing_project = cursor.fetchone()
-    if not existing_project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
-    # Prepare update values - use new values if provided, otherwise keep existing values
-    update_values = {
-        'name': project_data.projectName if project_data.projectName and project_data.projectName.strip() else existing_project['name'],
-        'project_info': project_data.projectInfo if project_data.projectInfo and project_data.projectInfo.strip() else existing_project['project_info'],
-        'db_host': encrypt(project_data.dbHost) if project_data.dbHost and project_data.dbHost.strip() else existing_project['db_host'],
-        'db_user': encrypt(project_data.dbUser) if project_data.dbUser and project_data.dbUser.strip() else existing_project['db_user'],
-        'db_password': encrypt(project_data.dbPassword) if project_data.dbPassword and project_data.dbPassword.strip() else existing_project['db_password'],
-        'db_name': encrypt(project_data.databaseName) if project_data.databaseName and project_data.databaseName.strip() else existing_project['db_name'],
-        'db_port': project_data.dbPort if project_data.dbPort and project_data.dbPort.strip() else existing_project.get('db_port', '3306'),
-        'db_info': project_data.dbInfo if project_data.dbInfo and project_data.dbInfo.strip() else existing_project['db_info'],
-        'bot_name': project_data.botName if project_data.botName and project_data.botName.strip() else existing_project['bot_name'],
-        'bot_avatar': project_data.botAvatar if project_data.botAvatar and project_data.botAvatar.strip() else existing_project['bot_avatar']
-    }
-    
-    # Update project with preserved values
-    cursor.execute(
-        """UPDATE projects SET name = %s, project_info = %s, db_host = %s, db_user = %s, 
-           db_password = %s, db_name = %s, db_port = %s, db_info = %s, bot_name = %s, bot_avatar = %s 
-           WHERE id = %s AND user_id = %s""",
-        (update_values['name'], update_values['project_info'],
-         update_values['db_host'], update_values['db_user'], 
-         update_values['db_password'], update_values['db_name'], update_values['db_port'],
-         update_values['db_info'], update_values['bot_name'], update_values['bot_avatar'],
-         project_id, current_user["user_id"])
-    )
-    conn.commit()
-    
-    cursor.close()
-    conn.close()
-    
-    return {"success": True, "message": "Project updated successfully"}
+    try:
+        cursor = conn.cursor(dictionary=True)
+        
+        # Check if project exists and belongs to user, and get current values
+        cursor.execute("SELECT * FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
+        existing_project = cursor.fetchone()
+        if not existing_project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Prepare update values - use new values if provided, otherwise keep existing values
+        update_values = {
+            'name': project_data.projectName if project_data.projectName and project_data.projectName.strip() else existing_project['name'],
+            'project_info': project_data.projectInfo if project_data.projectInfo and project_data.projectInfo.strip() else existing_project['project_info'],
+            'db_host': encrypt(project_data.dbHost) if project_data.dbHost and project_data.dbHost.strip() else existing_project['db_host'],
+            'db_user': encrypt(project_data.dbUser) if project_data.dbUser and project_data.dbUser.strip() else existing_project['db_user'],
+            'db_password': encrypt(project_data.dbPassword) if project_data.dbPassword and project_data.dbPassword.strip() else existing_project['db_password'],
+            'db_name': encrypt(project_data.databaseName) if project_data.databaseName and project_data.databaseName.strip() else existing_project['db_name'],
+            'db_port': project_data.dbPort if project_data.dbPort and project_data.dbPort.strip() else existing_project.get('db_port', '3306'),
+            'db_info': project_data.dbInfo if project_data.dbInfo and project_data.dbInfo.strip() else existing_project['db_info'],
+            'bot_name': project_data.botName if project_data.botName and project_data.botName.strip() else existing_project['bot_name'],
+            'bot_avatar': project_data.botAvatar if project_data.botAvatar and project_data.botAvatar.strip() else existing_project['bot_avatar']
+        }
+        
+        # Update project with preserved values
+        cursor.execute(
+            """UPDATE projects SET name = %s, project_info = %s, db_host = %s, db_user = %s, 
+               db_password = %s, db_name = %s, db_port = %s, db_info = %s, bot_name = %s, bot_avatar = %s 
+               WHERE id = %s AND user_id = %s""",
+            (update_values['name'], update_values['project_info'],
+             update_values['db_host'], update_values['db_user'], 
+             update_values['db_password'], update_values['db_name'], update_values['db_port'],
+             update_values['db_info'], update_values['bot_name'], update_values['bot_avatar'],
+             project_id, current_user["user_id"])
+        )
+        conn.commit()
+        
+        # Invalidate cache for this user's projects and this specific project
+        projects_cache_key = f"projects_{current_user['user_id']}"
+        project_cache_key = f"project_{project_id}_{current_user['user_id']}"
+        for key in [projects_cache_key, project_cache_key]:
+            if key in _cache:
+                del _cache[key]
+            if key in _cache_ttl:
+                del _cache_ttl[key]
+        
+        cursor.close()
+        return {"success": True, "message": "Project updated successfully"}
+    finally:
+        conn.close()
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, current_user: dict = Depends(get_current_user)):
@@ -1545,22 +1706,32 @@ async def delete_project(project_id: str, current_user: dict = Depends(get_curre
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     
-    cursor = conn.cursor(dictionary=True)
-    
-    # Check if project exists and belongs to user
-    cursor.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
-    project = cursor.fetchone()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
-    # Delete project
-    cursor.execute("DELETE FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
-    conn.commit()
-    
-    cursor.close()
-    conn.close()
-    
-    return {"success": True, "message": "Project deleted successfully"}
+    try:
+        cursor = conn.cursor(dictionary=True)
+        
+        # Check if project exists and belongs to user
+        cursor.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
+        project = cursor.fetchone()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Delete project
+        cursor.execute("DELETE FROM projects WHERE id = %s AND user_id = %s", (project_id, current_user["user_id"]))
+        conn.commit()
+        
+        # Invalidate cache for this user's projects and this specific project
+        projects_cache_key = f"projects_{current_user['user_id']}"
+        project_cache_key = f"project_{project_id}_{current_user['user_id']}"
+        for key in [projects_cache_key, project_cache_key]:
+            if key in _cache:
+                del _cache[key]
+            if key in _cache_ttl:
+                del _cache_ttl[key]
+        
+        cursor.close()
+        return {"success": True, "message": "Project deleted successfully"}
+    finally:
+        conn.close()
 
 def is_greeting(prompt):
     greetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'greetings']
@@ -1636,19 +1807,39 @@ Generate only the response text, no additional formatting or explanations.
 # Add this helper function near your DB helpers
 
 def get_last_10_messages(conversation_id: str, limit: int = 10):
+    """Optimized function to get last messages with connection pooling"""
     conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT id, role, content, created_at FROM messages
-        WHERE conversation_id = %s AND is_archived = FALSE
-        ORDER BY created_at ASC
-        LIMIT %s
-    """, (conversation_id, limit))
-    messages = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    # Already in chronological order (oldest to newest)
-    return messages
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor(dictionary=True)
+        # Ensure IST timezone
+        _ensure_ist_timezone(conn)
+        # Use UNIX_TIMESTAMP with CONVERT_TZ to get IST timestamps
+        from datetime import timezone, timedelta
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        cursor.execute("""
+            SELECT id, role, content, UNIX_TIMESTAMP(CONVERT_TZ(created_at, @@session.time_zone, '+05:30')) as created_at_ts, query_type, generated_sql
+            FROM messages
+            WHERE conversation_id = %s AND is_archived = FALSE
+            ORDER BY created_at ASC
+            LIMIT %s
+        """, (conversation_id, limit))
+        messages = cursor.fetchall()
+        
+        # Convert UNIX_TIMESTAMP to IST datetime with timezone
+        for msg in messages:
+            if msg.get('created_at_ts'):
+                dt = datetime.fromtimestamp(msg['created_at_ts'], tz=ist_tz)
+                msg['created_at'] = dt.isoformat()
+                msg.pop('created_at_ts', None)
+        
+        cursor.close()
+        # Already in chronological order (oldest to newest)
+        return messages
+    finally:
+        conn.close()
 
 @app.post("/api/analyze-data")
 async def analyze_data(request: AnalysisRequest, current_user: dict = Depends(get_current_user)):
@@ -1660,15 +1851,28 @@ async def analyze_data(request: AnalysisRequest, current_user: dict = Depends(ge
         conversation_id = request.conversationId or str(uuid.uuid4())
         is_first_message = not request.conversationId
 
-        # Fetch project details early for dynamic greeting
-        conn = get_db_connection()
-        if not conn:
-            raise HTTPException(status_code=500, detail="Database connection failed")
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM projects WHERE id = %s AND user_id = %s", (request.projectId, current_user["user_id"]))
-        project = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        # Fetch project details early for dynamic greeting - use cache if available
+        cache_key = f"project_{request.projectId}_{current_user['user_id']}"
+        current_time = time()
+        
+        if cache_key in _cache and cache_key in _cache_ttl and current_time < _cache_ttl[cache_key]:
+            project = _cache[cache_key]
+        else:
+            conn = get_db_connection()
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            try:
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute("SELECT * FROM projects WHERE id = %s AND user_id = %s", (request.projectId, current_user["user_id"]))
+                project = cursor.fetchone()
+                cursor.close()
+                if project:
+                    # Cache the project
+                    _cache[cache_key] = project
+                    _cache_ttl[cache_key] = current_time + CACHE_TTL_SECONDS
+            finally:
+                conn.close()
+        
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
         project_name = project.get('name', 'your project')
@@ -1701,42 +1905,53 @@ async def analyze_data(request: AnalysisRequest, current_user: dict = Depends(ge
                     existing_conversation = cursor.fetchone()
                     if not existing_conversation:
                         first_message = user_content.strip() if user_content else ''
-                        title = (first_message[:60] + '...') if len(first_message) > 60 else first_message or f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                        from datetime import timezone, timedelta
+                        ist_tz = timezone(timedelta(hours=5, minutes=30))
+                        title = (first_message[:60] + '...') if len(first_message) > 60 else first_message or f"Conversation {datetime.now(ist_tz).strftime('%Y-%m-%d %H:%M')}"
                         cursor.execute(
                             "INSERT INTO conversations (id, user_id, project_id, title) VALUES (%s, %s, %s, %s)",
                             (conversation_id, current_user["user_id"], request.projectId, title)
                         )
-                    # Store user message
+                    # Ensure IST timezone before inserting
+                    _ensure_ist_timezone(conn)
+                    
+                    # Store user message with explicit IST timestamp using MySQL's NOW() (respects session timezone)
                     user_message_id = str(uuid.uuid4())
                     cursor.execute(
-                        "INSERT INTO messages (id, conversation_id, user_id, role, content) VALUES (%s, %s, %s, %s, %s)",
+                        "INSERT INTO messages (id, conversation_id, user_id, role, content, created_at) VALUES (%s, %s, %s, %s, %s, NOW())",
                         (user_message_id, conversation_id, current_user["user_id"], 'human', user_content)
                     )
-                    # Store AI response
+                    # Store AI response with explicit IST timestamp using MySQL's NOW() (respects session timezone)
                     ai_message_id = str(uuid.uuid4())
                     cursor.execute(
-                        "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type) VALUES (%s, %s, %s, %s, %s, %s)",
+                        "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())",
                         (ai_message_id, conversation_id, current_user["user_id"], 'ai', ai_content, ai_query_type)
                     )
-                    # Update conversation timestamp
+                    # Update conversation timestamp with IST
                     cursor.execute(
-                        "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                        "UPDATE conversations SET updated_at = NOW() WHERE id = %s",
                         (conversation_id,)
                     )
                     conn.commit()
                     # Fetch created_at timestamps for user and AI messages BEFORE closing cursor/conn
-                    cursor.execute("SELECT created_at FROM messages WHERE id = %s", (user_message_id,))
+                    # Use UNIX_TIMESTAMP with CONVERT_TZ to get IST timestamp
+                    from datetime import timezone, timedelta
+                    ist_tz = timezone(timedelta(hours=5, minutes=30))
+                    _ensure_ist_timezone(conn)
+                    cursor.execute("SELECT UNIX_TIMESTAMP(CONVERT_TZ(created_at, @@session.time_zone, '+05:30')) as ts FROM messages WHERE id = %s", (user_message_id,))
                     user_created_at_row = cursor.fetchone()
-                    if user_created_at_row and user_created_at_row["created_at"]:
-                        user_created_at = user_created_at_row["created_at"].isoformat()
+                    if user_created_at_row and user_created_at_row.get("ts"):
+                        dt = datetime.fromtimestamp(user_created_at_row["ts"], tz=ist_tz)
+                        user_created_at = dt.isoformat()
                     else:
-                        user_created_at = datetime.datetime.now().isoformat()
-                    cursor.execute("SELECT created_at FROM messages WHERE id = %s", (ai_message_id,))
+                        user_created_at = datetime.now(ist_tz).isoformat()
+                    cursor.execute("SELECT UNIX_TIMESTAMP(CONVERT_TZ(created_at, @@session.time_zone, '+05:30')) as ts FROM messages WHERE id = %s", (ai_message_id,))
                     ai_created_at_row = cursor.fetchone()
-                    if ai_created_at_row and ai_created_at_row["created_at"]:
-                        ai_created_at = ai_created_at_row["created_at"].isoformat()
+                    if ai_created_at_row and ai_created_at_row.get("ts"):
+                        dt = datetime.fromtimestamp(ai_created_at_row["ts"], tz=ist_tz)
+                        ai_created_at = dt.isoformat()
                     else:
-                        ai_created_at = datetime.datetime.now().isoformat()
+                        ai_created_at = datetime.now(ist_tz).isoformat()
                     cursor.close()
                     conn.close()
             except Exception as e:
@@ -2057,29 +2272,32 @@ async def analyze_data(request: AnalysisRequest, current_user: dict = Depends(ge
                     # Create new conversation
                     # Use the first user message as the title, truncated to 60 chars
                     first_message = request.naturalLanguageQuery.strip() if hasattr(request, 'naturalLanguageQuery') else ''
-                    title = (first_message[:60] + '...') if len(first_message) > 60 else first_message or f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                    title = (first_message[:60] + '...') if len(first_message) > 60 else first_message or f"Conversation {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
                     cursor.execute(
                         "INSERT INTO conversations (id, user_id, project_id, title) VALUES (%s, %s, %s, %s)",
                         (conversation_id, current_user["user_id"], request.projectId, title)
                     )
                 
-                # Store user message
+                # Ensure IST timezone before inserting
+                _ensure_ist_timezone(conn)
+                
+                # Store user message with explicit IST timestamp using MySQL's NOW() (respects session timezone)
                 user_message_id = str(uuid.uuid4())
                 cursor.execute(
-                    "INSERT INTO messages (id, conversation_id, user_id, role, content) VALUES (%s, %s, %s, %s, %s)",
+                    "INSERT INTO messages (id, conversation_id, user_id, role, content, created_at) VALUES (%s, %s, %s, %s, %s, NOW())",
                     (user_message_id, conversation_id, current_user["user_id"], 'human', request.naturalLanguageQuery)
                 )
                 
-                # Store AI response
+                # Store AI response with explicit IST timestamp using MySQL's NOW() (respects session timezone)
                 ai_message_id = str(uuid.uuid4())
                 cursor.execute(
-                    "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type) VALUES (%s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())",
                     (ai_message_id, conversation_id, current_user["user_id"], 'ai', analysis, "DATABASE")
                 )
                 
-                # Update conversation timestamp
+                # Update conversation timestamp with IST
                 cursor.execute(
-                    "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                    "UPDATE conversations SET updated_at = NOW() WHERE id = %s",
                     (conversation_id,)
                 )
                 
@@ -2089,21 +2307,27 @@ async def analyze_data(request: AnalysisRequest, current_user: dict = Depends(ge
             # Continue without failing the request
         
         # Fetch created_at timestamps for user and AI messages BEFORE closing cursor/conn
-        cursor.execute("SELECT created_at FROM messages WHERE id = %s", (user_message_id,))
+        # Ensure IST timezone and use CONVERT_TZ to get IST timestamp
+        from datetime import timezone, timedelta
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        _ensure_ist_timezone(conn)
+        cursor.execute("SELECT UNIX_TIMESTAMP(CONVERT_TZ(created_at, @@session.time_zone, '+05:30')) as ts FROM messages WHERE id = %s", (user_message_id,))
         user_created_at_row = cursor.fetchone()
-        if user_created_at_row and user_created_at_row["created_at"]:
-            user_created_at = user_created_at_row["created_at"].isoformat()
+        if user_created_at_row and user_created_at_row.get("ts"):
+            dt = datetime.fromtimestamp(user_created_at_row["ts"], tz=ist_tz)
+            user_created_at = dt.isoformat()
         else:
             print(f"[WARNING] Could not fetch created_at for user message {user_message_id}, using now().")
-            user_created_at = datetime.datetime.now().isoformat()
+            user_created_at = datetime.now(ist_tz).isoformat()
 
-        cursor.execute("SELECT created_at FROM messages WHERE id = %s", (ai_message_id,))
+        cursor.execute("SELECT UNIX_TIMESTAMP(CONVERT_TZ(created_at, @@session.time_zone, '+05:30')) as ts FROM messages WHERE id = %s", (ai_message_id,))
         ai_created_at_row = cursor.fetchone()
-        if ai_created_at_row and ai_created_at_row["created_at"]:
-            ai_created_at = ai_created_at_row["created_at"].isoformat()
+        if ai_created_at_row and ai_created_at_row.get("ts"):
+            dt = datetime.fromtimestamp(ai_created_at_row["ts"], tz=ist_tz)
+            ai_created_at = dt.isoformat()
         else:
             print(f"[WARNING] Could not fetch created_at for AI message {ai_message_id}, using now().")
-            ai_created_at = datetime.datetime.now().isoformat()
+            ai_created_at = datetime.now(ist_tz).isoformat()
 
         cursor.close()
         conn.close()
@@ -2229,16 +2453,19 @@ async def generate_visualization(request: AnalysisRequest, current_user: dict = 
             cursor.execute(create_table_query)
             print("[DEBUG] Visualizations table created/verified")
             
-            # Store the user message first
+            # Ensure IST timezone before inserting
+            _ensure_ist_timezone(conn)
+            
+            # Store the user message first with explicit IST timestamp using MySQL's NOW() (respects session timezone)
             cursor.execute(
-                "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type) VALUES (%s, %s, %s, %s, %s, %s)",
+                "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())",
                 (user_message_id, request.conversationId, current_user["user_id"], 'human', request.naturalLanguageQuery, "VISUALIZATION_REQUEST")
             )
             print(f"[DEBUG] User message stored with ID: {user_message_id}")
             
-            # Store the AI message with visualization
+            # Store the AI message with visualization with explicit IST timestamp using MySQL's NOW() (respects session timezone)
             cursor.execute(
-                "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type) VALUES (%s, %s, %s, %s, %s, %s)",
+                "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())",
                 (ai_message_id, request.conversationId, current_user["user_id"], 'ai', analysis, "VISUALIZATION")
             )
             print(f"[DEBUG] AI message with visualization stored with ID: {ai_message_id}")
@@ -2509,7 +2736,9 @@ async def create_conversation(conversation_data: ConversationCreate, current_use
             first_message = conversation_data.firstMessage.strip()
             title = (first_message[:60] + '...') if len(first_message) > 60 else first_message
         else:
-            title = f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            from datetime import timezone, timedelta
+            ist_tz = timezone(timedelta(hours=5, minutes=30))
+            title = f"Conversation {datetime.now(ist_tz).strftime('%Y-%m-%d %H:%M')}"
         
         cursor.execute(
             "INSERT INTO conversations (id, user_id, project_id, title) VALUES (%s, %s, %s, %s)",
@@ -2520,13 +2749,15 @@ async def create_conversation(conversation_data: ConversationCreate, current_use
         cursor.close()
         conn.close()
         
+        from datetime import timezone, timedelta
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
         return {
             "success": True,
             "data": {
                 "id": conversation_id,
                 "title": title,
                 "projectId": conversation_data.projectId,
-                "createdAt": datetime.now().isoformat()
+                "createdAt": datetime.now(ist_tz).isoformat()
             }
         }
     except Exception as e:
@@ -2575,9 +2806,14 @@ async def get_conversation(conversation_id: str, current_user: dict = Depends(ge
             cursor.close()
             conn.close()
             raise HTTPException(status_code=404, detail="Conversation not found")
+        # Ensure IST timezone for this query (double-check)
+        _ensure_ist_timezone(conn)
+        
         # Fetch messages for this conversation with visualizations
+        # Use UNIX_TIMESTAMP with CONVERT_TZ to ensure we get IST regardless of how MySQL stored it
         cursor.execute("""
-            SELECT m.id as id, m.conversation_id, m.user_id, m.role, m.content, m.query_type, m.generated_sql, m.created_at,
+            SELECT m.id as id, m.conversation_id, m.user_id, m.role, m.content, m.query_type, m.generated_sql, 
+                   UNIX_TIMESTAMP(CONVERT_TZ(m.created_at, @@session.time_zone, '+05:30')) as created_at_timestamp,
                    v.id as visualization_id, v.title as visualization_title, v.chart_type, v.chart_data, v.query_used as visualization_query
             FROM messages m
             LEFT JOIN visualizations v ON m.id = v.message_id AND v.is_archived = FALSE
@@ -2585,6 +2821,17 @@ async def get_conversation(conversation_id: str, current_user: dict = Depends(ge
             ORDER BY m.created_at ASC
         """, (conversation_id,))
         messages = cursor.fetchall()
+        
+        # Convert UNIX_TIMESTAMP to IST datetime with timezone info
+        from datetime import timezone, timedelta
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        for message in messages:
+            if message.get('created_at_timestamp'):
+                # UNIX_TIMESTAMP returns seconds since epoch, convert to IST
+                dt = datetime.fromtimestamp(message['created_at_timestamp'], tz=ist_tz)
+                message['created_at'] = dt.isoformat()
+            # Remove the temporary timestamp field
+            message.pop('created_at_timestamp', None)
         
         # Process messages and add visualization data
         processed_messages = []
@@ -2721,18 +2968,21 @@ async def create_message(message_data: MessageCreate, current_user: dict = Depen
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
         
+        # Ensure IST timezone before inserting
+        _ensure_ist_timezone(conn)
+        
         message_id = str(uuid.uuid4())
         
         cursor.execute(
-            "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type, generated_sql) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            "INSERT INTO messages (id, conversation_id, user_id, role, content, query_type, generated_sql, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())",
             (message_id, message_data.conversationId, current_user["user_id"], message_data.role, message_data.content,
              message_data.queryType, message_data.generatedSql)
         )
         
-        # Update conversation's updated_at timestamp
+        # Update conversation's updated_at timestamp with IST
         cursor.execute(
-            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            "UPDATE conversations SET updated_at = NOW() WHERE id = %s",
             (message_data.conversationId,)
         )
         
@@ -2743,6 +2993,8 @@ async def create_message(message_data: MessageCreate, current_user: dict = Depen
         
         # After message creation, broadcast chat update
         await broadcast_project_update(message_data.conversationId, {"type": "chat_update"})
+        from datetime import timezone, timedelta
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
         return {
             "success": True,
             "data": {
@@ -2750,7 +3002,7 @@ async def create_message(message_data: MessageCreate, current_user: dict = Depen
                 "conversationId": message_data.conversationId,
                 "role": message_data.role,
                 "content": message_data.content,
-                "createdAt": datetime.now().isoformat()
+                "createdAt": datetime.now(ist_tz).isoformat()
             }
         }
     except Exception as e:

@@ -80,6 +80,7 @@ const EditProjectForm = () => {
     });
     const [selectedAvatar, setSelectedAvatar] = useState('');
     const [errors, setErrors] = useState({});
+    const [dbType, setDbType] = useState('aws'); // 'local' or 'aws'
 
     const dispatch = useDispatch();
     const router = useRouter();
@@ -96,12 +97,17 @@ const EditProjectForm = () => {
 
     useEffect(() => {
         if (project && project.id === projectId) {
+            const currentDbHost = project.dbHost || project.db_host || '';
+            // Detect if it's local or AWS based on the host
+            const detectedType = (currentDbHost === 'localhost' || currentDbHost === '127.0.0.1' || currentDbHost === '') ? 'local' : 'aws';
+            setDbType(detectedType);
+            
             setFormData({
                 projectName: project.name || '',
                 projectInfo: project.project_info || '',
                 dbInfo: project.db_info || '',
                 botName: project.bot_name || '',
-                dbHost: '', // Leave blank - user can enter new host
+                dbHost: currentDbHost, // Show current host
                 dbUser: '', // Leave blank - user can enter new username
                 dbPassword: '', // Leave blank - user can enter new password
                 dbPort: project.db_port || '3306', // Show current port
@@ -169,13 +175,107 @@ const EditProjectForm = () => {
                                 <h2 className="text-xl font-semibold border-b pb-3 mb-6
                                              text-gray-900 dark:text-white
                                              border-gray-200 dark:border-gray-700">Database Credentials</h2>
-                                <p className="text-xs -mt-4 mb-4 text-gray-600 dark:text-gray-500">Leave fields blank to keep them unchanged.</p>
+                                
+                                {/* Database Type Selector */}
+                                <div className="mb-6">
+                                    <label className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3 block">
+                                        Database Type
+                                    </label>
+                                    <div className="flex gap-4">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setDbType('aws');
+                                                if (!formData.dbHost || formData.dbHost === 'localhost' || formData.dbHost === '127.0.0.1') {
+                                                    setFormData({ ...formData, dbHost: '' });
+                                                }
+                                            }}
+                                            className={`px-4 py-2 rounded-lg border-2 transition-all ${
+                                                dbType === 'aws'
+                                                    ? 'bg-sky-500 text-white border-sky-500 dark:bg-sky-600 dark:border-sky-600'
+                                                    : 'bg-gray-50 text-gray-700 border-gray-300 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 hover:border-sky-400'
+                                            }`}
+                                        >
+                                            AWS RDS
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setDbType('local');
+                                                if (!formData.dbHost || formData.dbHost.includes('rds.amazonaws.com')) {
+                                                    setFormData({ ...formData, dbHost: 'localhost' });
+                                                }
+                                            }}
+                                            className={`px-4 py-2 rounded-lg border-2 transition-all ${
+                                                dbType === 'local'
+                                                    ? 'bg-sky-500 text-white border-sky-500 dark:bg-sky-600 dark:border-sky-600'
+                                                    : 'bg-gray-50 text-gray-700 border-gray-300 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 hover:border-sky-400'
+                                            }`}
+                                        >
+                                            Local Database
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <p className="text-xs -mt-4 mb-4 text-gray-600 dark:text-gray-500">
+                                    {dbType === 'aws' 
+                                        ? 'Update your AWS RDS MySQL connection details. Leave fields blank to keep them unchanged.'
+                                        : 'Update your local MySQL database connection details. Leave fields blank to keep them unchanged.'
+                                    }
+                                </p>
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                    <FormInput icon={<FaDatabase className="text-gray-500 dark:text-gray-400"/>} id="dbHost" label="Database Host" value={formData.dbHost} onChange={handleInputChange} error={errors.dbHost} placeholder="Enter new host (e.g., my-db.cluster-123456789012.us-east-1.rds.amazonaws.com)" />
-                                    <FormInput icon={<FaUserShield className="text-gray-500 dark:text-gray-400"/>} id="dbUser" label="Database User" value={formData.dbUser} onChange={handleInputChange} error={errors.dbUser} placeholder="Enter new username (e.g., rds_admin)" />
-                                    <FormInput icon={<FaKey className="text-gray-500 dark:text-gray-400"/>} id="dbPassword" type="password" label="Database Password" value={formData.dbPassword} onChange={handleInputChange} error={errors.dbPassword} placeholder="Enter new password" />
-                                    <FormInput icon={<FaServer className="text-gray-500 dark:text-gray-400"/>} id="databaseName" label="Database Name" value={formData.databaseName} onChange={handleInputChange} error={errors.databaseName} placeholder="Enter new database name (e.g., chatbot)" />
-                                    <FormInput icon={<FaDatabase className="text-gray-500 dark:text-gray-400"/>} id="dbPort" label="Database Port" value={formData.dbPort} onChange={handleInputChange} error={errors.dbPort} placeholder="Default 3306 for AWS RDS MySQL" />
+                                    <FormInput 
+                                        icon={<FaDatabase className="text-gray-500 dark:text-gray-400"/>} 
+                                        id="dbHost" 
+                                        label="Database Host" 
+                                        value={formData.dbHost} 
+                                        onChange={handleInputChange} 
+                                        error={errors.dbHost} 
+                                        placeholder={dbType === 'aws' 
+                                            ? 'Enter new host (e.g., my-db.cluster-123456789012.us-east-1.rds.amazonaws.com)'
+                                            : 'Enter new host (e.g., localhost or 127.0.0.1)'
+                                        } 
+                                    />
+                                    <FormInput 
+                                        icon={<FaUserShield className="text-gray-500 dark:text-gray-400"/>} 
+                                        id="dbUser" 
+                                        label="Database User" 
+                                        value={formData.dbUser} 
+                                        onChange={handleInputChange} 
+                                        error={errors.dbUser} 
+                                        placeholder={dbType === 'aws' ? 'Enter new username (e.g., rds_admin)' : 'Enter new username (e.g., root)'} 
+                                    />
+                                    <FormInput 
+                                        icon={<FaKey className="text-gray-500 dark:text-gray-400"/>} 
+                                        id="dbPassword" 
+                                        type="password" 
+                                        label="Database Password" 
+                                        value={formData.dbPassword} 
+                                        onChange={handleInputChange} 
+                                        error={errors.dbPassword} 
+                                        placeholder="Enter new password" 
+                                    />
+                                    <FormInput 
+                                        icon={<FaServer className="text-gray-500 dark:text-gray-400"/>} 
+                                        id="databaseName" 
+                                        label="Database Name" 
+                                        value={formData.databaseName} 
+                                        onChange={handleInputChange} 
+                                        error={errors.databaseName} 
+                                        placeholder="Enter new database name (e.g., chatbot)" 
+                                    />
+                                    <FormInput 
+                                        icon={<FaDatabase className="text-gray-500 dark:text-gray-400"/>} 
+                                        id="dbPort" 
+                                        label="Database Port" 
+                                        value={formData.dbPort} 
+                                        onChange={handleInputChange} 
+                                        error={errors.dbPort} 
+                                        placeholder={dbType === 'aws' 
+                                            ? 'Default 3306 for AWS RDS MySQL'
+                                            : 'Default 3306 for local MySQL'
+                                        } 
+                                    />
                                 </div>
                             </section>
 

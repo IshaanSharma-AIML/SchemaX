@@ -3,10 +3,10 @@ import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import { toast } from 'react-hot-toast';
 import { v4 as uuidv4 } from 'uuid';
 
-const API_URL = process.env.NEXT_PUBLIC_API_BASE;
+const API_URL = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000/api';
 
-if (!API_URL) {
-    console.error('[CONFIG] NEXT_PUBLIC_API_BASE is not defined. Chat API requests will fail until it is set.');
+if (!process.env.NEXT_PUBLIC_API_BASE) {
+    console.warn('[CONFIG] NEXT_PUBLIC_API_BASE not set; defaulting chat requests to http://localhost:8000/api for local development.');
 }
 
 // --- Async Thunk for sending a message to the AI ---

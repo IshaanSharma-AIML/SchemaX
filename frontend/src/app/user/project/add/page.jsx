@@ -98,6 +98,7 @@ const AddProjectPage = () => {
     const [dbPort, setDbPort] = useState('3306');
     const [dbInfo, setDbInfo] = useState('');
     const [botName, setBotName] = useState('');
+    const [dbType, setDbType] = useState('aws'); // 'local' or 'aws'
     const [selectedAvatar, setSelectedAvatar] = useState(avatars[0]);
     const [errors, setErrors] = useState({});
 
@@ -176,8 +177,51 @@ const AddProjectPage = () => {
                             <h2 className="text-xl font-semibold border-b pb-3 mb-6
                                          text-gray-900 dark:text-white
                                          border-gray-200 dark:border-gray-700">Database Credentials</h2>
+                            
+                            {/* Database Type Selector */}
+                            <div className="mb-6">
+                                <label className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3 block">
+                                    Database Type
+                                </label>
+                                <div className="flex gap-4">
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setDbType('aws');
+                                            if (!dbHost) setDbHost('');
+                                            if (!dbPort) setDbPort('3306');
+                                        }}
+                                        className={`px-4 py-2 rounded-lg border-2 transition-all ${
+                                            dbType === 'aws'
+                                                ? 'bg-sky-500 text-white border-sky-500 dark:bg-sky-600 dark:border-sky-600'
+                                                : 'bg-gray-50 text-gray-700 border-gray-300 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 hover:border-sky-400'
+                                        }`}
+                                    >
+                                        AWS RDS
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setDbType('local');
+                                            if (!dbHost) setDbHost('localhost');
+                                            if (!dbPort) setDbPort('3306');
+                                        }}
+                                        className={`px-4 py-2 rounded-lg border-2 transition-all ${
+                                            dbType === 'local'
+                                                ? 'bg-sky-500 text-white border-sky-500 dark:bg-sky-600 dark:border-sky-600'
+                                                : 'bg-gray-50 text-gray-700 border-gray-300 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 hover:border-sky-400'
+                                        }`}
+                                    >
+                                        Local Database
+                                    </button>
+                                </div>
+                            </div>
+
                             <p className="text-xs -mt-4 mb-4 text-gray-600 dark:text-gray-500">
-                                Provide your AWS RDS MySQL connection details. Use the endpoint (hostname), admin user, and database you created in RDS.
+                                {dbType === 'aws' 
+                                    ? 'Provide your AWS RDS MySQL connection details. Use the endpoint (hostname), admin user, and database you created in RDS.'
+                                    : 'Provide your local MySQL database connection details. Make sure your local MySQL server is running and accessible.'
+                                }
                             </p>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 <FormInput
@@ -187,7 +231,10 @@ const AddProjectPage = () => {
                                     value={dbHost}
                                     onChange={(e) => setDbHost(e.target.value)}
                                     required
-                                    placeholder="e.g., my-db.cluster-123456789012.us-east-1.rds.amazonaws.com"
+                                    placeholder={dbType === 'aws' 
+                                        ? 'e.g., my-db.cluster-123456789012.us-east-1.rds.amazonaws.com'
+                                        : 'e.g., localhost or 127.0.0.1'
+                                    }
                                     error={errors.dbHost}
                                 />
                                 <FormInput
@@ -197,7 +244,7 @@ const AddProjectPage = () => {
                                     value={dbUser}
                                     onChange={(e) => setDbUser(e.target.value)}
                                     required
-                                    placeholder="e.g., rds_admin"
+                                    placeholder={dbType === 'aws' ? 'e.g., rds_admin' : 'e.g., root'}
                                     error={errors.dbUser}
                                 />
                                 <FormInput
@@ -227,7 +274,10 @@ const AddProjectPage = () => {
                                     label="Database Port"
                                     value={dbPort}
                                     onChange={(e) => setDbPort(e.target.value)}
-                                    placeholder="Default 3306 for AWS RDS MySQL"
+                                    placeholder={dbType === 'aws' 
+                                        ? 'Default 3306 for AWS RDS MySQL'
+                                        : 'Default 3306 for local MySQL'
+                                    }
                                     error={errors.dbPort}
                                 />
                             </div>

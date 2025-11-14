@@ -4,11 +4,13 @@ import { useState, useRef, useEffect } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import { useParams, useSearchParams } from 'next/navigation';
 import { sendMessage, addHumanMessage, addAiMessage, clearChat, getChatHistory, markMessageImportant, unmarkMessageImportant, deleteMessage, getImportantMessages, getConversations, generateVisualization } from '@/lib/store/users-panel/chat/chatSlice';
-import { FaRobot, FaPaperPlane, FaUser, FaStar, FaChevronDown, FaTrash, FaChartBar } from 'react-icons/fa';
+import { FaRobot, FaPaperPlane, FaUser, FaStar, FaChevronDown, FaTrash, FaChartBar, FaMicrophone, FaMicrophoneSlash } from 'react-icons/fa';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { getProjects } from '@/lib/store/users-panel/projects/projectSlice';
-import { format, isValid } from 'date-fns';
+import { format, isValid, isToday, isYesterday } from 'date-fns';
+import { useVoiceRecognition } from '@/hooks/useVoiceRecognition';
+import { toast } from 'react-hot-toast';
 
 // Enhanced Visualization Component with Labels
 const VisualizationComponent = ({ visualization }) => {
@@ -411,12 +413,55 @@ const MessageBubble = ({ message, aiAgentName, onToggleImportance, isImportant }
         }
     };
 
-    // Format date and time
+    // Format date and time according to device's local timezone and locale
     const dateString = message.createdAt || message.created_at;
-    const dateObj = new Date(dateString);
-    const formattedDateTime = isValid(dateObj)
-      ? format(dateObj, 'HH:mm')
-      : '';
+    
+    // Parse date string - handle both ISO format with/without timezone
+    let dateObj;
+    if (typeof dateString === 'string') {
+        // If the string doesn't end with Z or have timezone, assume UTC
+        const normalizedDate = dateString.endsWith('Z') || dateString.includes('+') || dateString.includes('-', 10)
+            ? dateString
+            : dateString + 'Z';
+        dateObj = new Date(normalizedDate);
+    } else if (dateString instanceof Date) {
+        dateObj = dateString;
+    } else {
+        dateObj = new Date(dateString);
+    }
+    
+    const formattedDateTime = (() => {
+        if (!isValid(dateObj) || isNaN(dateObj.getTime())) return '';
+        
+        const now = new Date();
+        const diffInMinutes = Math.floor((now - dateObj) / (1000 * 60));
+        
+        // Show relative time for recent messages (within last hour)
+        if (diffInMinutes < 1) {
+            return 'Just now';
+        } else if (diffInMinutes < 60) {
+            return `${diffInMinutes} min ago`;
+        }
+        
+        // Show time for today's messages
+        if (isToday(dateObj)) {
+            return format(dateObj, 'h:mm a'); // e.g., "2:30 PM"
+        }
+        
+        // Show "Yesterday" for yesterday's messages
+        if (isYesterday(dateObj)) {
+            return `Yesterday ${format(dateObj, 'h:mm a')}`;
+        }
+        
+        // Show date and time for older messages
+        const diffInDays = Math.floor((now - dateObj) / (1000 * 60 * 60 * 24));
+        if (diffInDays < 7) {
+            return format(dateObj, 'EEE h:mm a'); // e.g., "Mon 2:30 PM"
+        }
+        
+        // Show full date for older messages
+        return format(dateObj, 'MMM d, h:mm a'); // e.g., "Jan 15, 2:30 PM"
+    })();
 
     // Convert AI message content to bullet points and extract greeting
     const { greeting, bulletPoints } = isAi ? convertToBulletPoints(message.content) : { greeting: null, bulletPoints: null };
@@ -471,7 +516,12 @@ const MessageBubble = ({ message, aiAgentName, onToggleImportance, isImportant }
                     </div>
                     {/* Timestamp and actions */}
                     <div className="flex items-center justify-between mt-3 pt-2 border-t border-gray-100 dark:border-gray-700">
-                        <div className="text-xs text-gray-400">{formattedDateTime}</div>
+                        <div 
+                            className="text-xs text-gray-400 cursor-help" 
+                            title={isValid(dateObj) ? format(dateObj, 'PPpp') : ''} // Full date/time on hover
+                        >
+                            {formattedDateTime}
+                        </div>
                         {/* Star Button */}
                         {message.id && message.id !== null && (
                             <button
@@ -520,6 +570,17 @@ const ChatPage = () => {
     const chatContainerRef = useRef(null);
     const inputRef = useRef(null);
     const prevConversationIdRef = useRef(null);
+    
+    // Voice recognition hook
+    const {
+        isListening,
+        transcript,
+        error: voiceError,
+        isSupported: isVoiceSupported,
+        startListening,
+        stopListening,
+        resetTranscript,
+    } = useVoiceRecognition();
 
     const dispatch = useDispatch();
     const routerParams = useParams();
@@ -545,12 +606,28 @@ const ChatPage = () => {
             dispatch(getProjects());
         }
 
-        // Only clear chat if starting a new chat or switching to no conversation
-        if (isNewChat || !urlConversationId) {
+        // Clear chat if starting a new chat
+        if (isNewChat) {
             dispatch(clearChat());
+            // Clear input field
+            setInputValue('');
+            // Reset textarea height
+            if (inputRef.current) {
+                inputRef.current.style.height = 'auto';
+            }
+            // Remove the 'new=1' and 't' (timestamp) parameters from URL after clearing
+            setTimeout(() => {
+                if (typeof window !== 'undefined') {
+                    const url = new URL(window.location.href);
+                    url.searchParams.delete('new');
+                    url.searchParams.delete('t'); // Remove timestamp parameter
+                    const newUrl = url.pathname + (url.search ? url.search : '');
+                    window.history.replaceState({}, '', newUrl);
+                }
+            }, 100);
         }
 
-        // Load chat history if conversationId is provided in URL
+        // Load chat history if conversationId is provided in URL (and not a new chat)
         if (urlConversationId && !isNewChat) {
             dispatch(getChatHistory(urlConversationId));
         }
@@ -611,6 +688,11 @@ const ChatPage = () => {
             return;
         }
 
+        // Stop voice recognition if it's active
+        if (isListening) {
+            stopListening();
+        }
+
         dispatch(addHumanMessage({ content: userMessage }));
         dispatch(sendMessage({
             naturalLanguageQuery: userMessage,
@@ -619,6 +701,7 @@ const ChatPage = () => {
         }));
 
         setInputValue('');
+        resetTranscript();
         // Reset textarea height
         if (inputRef.current) {
             inputRef.current.style.height = 'auto';
@@ -638,6 +721,11 @@ const ChatPage = () => {
             return;
         }
 
+        // Stop voice recognition if it's active
+        if (isListening) {
+            stopListening();
+        }
+
         dispatch(addHumanMessage({ content: userMessage }));
         
         // Add a placeholder AI message for the visualization
@@ -654,6 +742,7 @@ const ChatPage = () => {
         }));
 
         setInputValue('');
+        resetTranscript();
         // Reset textarea height
         if (inputRef.current) {
             inputRef.current.style.height = 'auto';
@@ -678,6 +767,30 @@ const ChatPage = () => {
             }
         }
     }, [inputValue]);
+
+    // Update input value when transcript changes
+    useEffect(() => {
+        if (transcript) {
+            setInputValue(transcript);
+        }
+    }, [transcript]);
+
+    // Show error toast when voice recognition fails
+    useEffect(() => {
+        if (voiceError) {
+            toast.error(voiceError);
+        }
+    }, [voiceError]);
+
+    // Handle voice input toggle
+    const handleVoiceToggle = () => {
+        if (isListening) {
+            stopListening();
+        } else {
+            resetTranscript();
+            startListening();
+        }
+    };
 
     const handleToggleImportance = async (messageId, isImportant) => {
         if (isImportant) {
@@ -895,7 +1008,33 @@ const ChatPage = () => {
                                     }
                                 }}
                             />
+                            {/* Voice listening indicator */}
+                            {isListening && (
+                                <div className="absolute top-2 right-2 flex items-center gap-2 px-2 py-1 bg-red-500 text-white rounded-full text-xs animate-pulse">
+                                    <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
+                                    <span>Listening...</span>
+                                </div>
+                            )}
                         </div>
+                        {isVoiceSupported && (
+                            <button
+                                type="button"
+                                onClick={handleVoiceToggle}
+                                className={`rounded-full p-3 transition-all duration-200 shadow-lg ${
+                                    isListening
+                                        ? 'bg-gradient-to-r from-red-500 to-red-700 hover:from-red-600 hover:to-red-800 text-white animate-pulse'
+                                        : 'bg-gradient-to-r from-gray-500 to-gray-700 hover:from-gray-600 hover:to-gray-800 text-white'
+                                }`}
+                                disabled={isLoading}
+                                title={isListening ? 'Stop recording' : 'Start voice input'}
+                            >
+                                {isListening ? (
+                                    <FaMicrophoneSlash className="w-4 h-4" />
+                                ) : (
+                                    <FaMicrophone className="w-4 h-4" />
+                                )}
+                            </button>
+                        )}
                         <button
                             type="button"
                             onClick={handleGenerateVisualization}
@@ -917,7 +1056,10 @@ const ChatPage = () => {
                         </button>
                     </form>
                     <div className="text-xs text-gray-500 dark:text-gray-400 mt-2 text-center">
-                        Press Enter to send, Shift+Enter for new line • Click 📊 for visualizations
+                        {isVoiceSupported 
+                            ? 'Press Enter to send, Shift+Enter for new line • Click 🎤 for voice input • Click 📊 for visualizations'
+                            : 'Press Enter to send, Shift+Enter for new line • Click 📊 for visualizations'
+                        }
                     </div>
                 </div>
             </div>

@@ -1,7 +1,7 @@
 'use client';
 
-import { useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useDispatch, useSelector } from 'react-redux';
 import { loginUser, reset } from '@/lib/store/users-panel/auth/authSlice';
 import { FaEnvelope, FaLock, FaEye, FaEyeSlash, FaArrowRight } from 'react-icons/fa';
@@ -12,10 +12,38 @@ export default function LoginPage() {
     const [password, setPassword] = useState('');
     const [showPassword, setShowPassword] = useState(false);
     const router = useRouter();
+    const searchParams = useSearchParams();
     const dispatch = useDispatch();
     const { theme } = useTheme();
     
     const { isLoading, isError, message, isSuccess } = useSelector((state) => state.auth);
+
+    // Remove credentials from URL if present (security measure)
+    useEffect(() => {
+        const urlEmail = searchParams.get('email');
+        const urlPassword = searchParams.get('password');
+        
+        if (urlEmail || urlPassword) {
+            // Extract credentials from URL
+            if (urlEmail) {
+                setEmail(decodeURIComponent(urlEmail));
+            }
+            if (urlPassword) {
+                setPassword(decodeURIComponent(urlPassword));
+            }
+            
+            // Immediately remove credentials from URL for security
+            // This prevents credentials from being stored in browser history, server logs, or shared
+            // Use window.history.replaceState for immediate removal without page reload
+            if (typeof window !== 'undefined') {
+                window.history.replaceState(
+                    {},
+                    '',
+                    window.location.pathname
+                );
+            }
+        }
+    }, [searchParams]);
 
     const handleSubmit = async (e) => {
         e.preventDefault();

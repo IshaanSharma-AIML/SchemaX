@@ -19,7 +19,7 @@ import {
     updateConversation,
     getImportantMessages
 } from '@/lib/store/users-panel/chat/chatSlice';
-import { format, isValid } from 'date-fns';
+import { format, isValid, isToday, isYesterday } from 'date-fns';
 
 // Enhanced CSS for sidebar scrollbar
 const sidebarScrollbarStyles = `
@@ -140,7 +140,10 @@ const Sidebar = () => {
     const handleNewChat = () => {
         console.log('New Chat button clicked, projectId:', projectId);
         if (projectId) {
-            router.push(`/user/${projectId}/chat?new=1`);
+            // Use replace to avoid adding to history and ensure clean state
+            // Add timestamp to force navigation even if already on chat page
+            const timestamp = Date.now();
+            router.replace(`/user/${projectId}/chat?new=1&t=${timestamp}`);
         } else {
             console.error('No projectId available for new chat');
         }
@@ -221,13 +224,11 @@ const Sidebar = () => {
         if (!dateString) return '';
         const date = new Date(dateString);
         if (!isValid(date)) return '';
-        const today = new Date();
-        const yesterday = new Date(today);
-        yesterday.setDate(yesterday.getDate() - 1);
         
-        if (format(date, 'yyyy-MM-dd') === format(today, 'yyyy-MM-dd')) {
+        // Use date-fns helpers for better timezone handling
+        if (isToday(date)) {
             return 'Today';
-        } else if (format(date, 'yyyy-MM-dd') === format(yesterday, 'yyyy-MM-dd')) {
+        } else if (isYesterday(date)) {
             return 'Yesterday';
         } else {
             return format(date, 'MMM d, yyyy');
